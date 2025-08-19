@@ -56,7 +56,7 @@ def render_top5_with_compare(top5_results, query=None):
                 pool = pool[-2:]
         st.session_state.compare_pool = pool
 
-    st.markdown("## Top 5 结果（可勾选对比）")
+    st.markdown("## Top 5 ")
 
     for i, p in enumerate(top5_results):
         asin = p.get("parent_asin") or p.get("asin") or str(i)
@@ -76,7 +76,7 @@ def render_top5_with_compare(top5_results, query=None):
                 st.caption(" • ".join(map(str, feats[:4])))
         with col_chk:
             checked = (i, asin) in st.session_state.compare_pool
-            if st.checkbox("对比", value=checked, key=f"compare_{i}_{asin}"):
+            if st.checkbox("comparison", value=checked, key=f"compare_{i}_{asin}"):
                 if not checked:
                     toggle_selection(i, asin)
             else:
@@ -89,28 +89,28 @@ def render_top5_with_compare(top5_results, query=None):
         left, right = left_raw, right_raw
 
         st.markdown("---")
-        st.subheader("🔍 对比面板 (已选择 2 项)")
+        st.subheader("🔍 Comparison panel (2 items selected)")
         st.markdown(f"**A. {left.get('title','(Untitled)')}**")
         st.markdown(f"**B. {right.get('title','(Untitled)')}**")
 
         rows = [
-    ("价格", left.get("price","N/A"), right.get("price","N/A")),
-    ("评分", f"{as_scalar(left.get('average_rating'))} ({as_scalar(left.get('rating_number'))})",
+    ("price", left.get("price","N/A"), right.get("price","N/A")),
+    ("average_rating", f"{as_scalar(left.get('average_rating'))} ({as_scalar(left.get('rating_number'))})",
              f"{as_scalar(right.get('average_rating'))} ({as_scalar(right.get('rating_number'))})"),
-    ("品牌/店铺", left.get("store") or left.get("brand_clean") or "",
+    ("Brand/Store", left.get("store") or left.get("brand_clean") or "",
                  right.get("store") or right.get("brand_clean") or ""),
-    ("品类",
+    ("Category",
      " / ".join(map(str, as_list(left.get("categories", []))[:3])),
      " / ".join(map(str, as_list(right.get("categories", []))[:3]))),
-    ("特性",
+    ("features",
      ", ".join(map(str, as_list(left.get("features", []))[:8])),
      ", ".join(map(str, as_list(right.get("features", []))[:8]))),
-    ("描述(摘要)", str(left.get("description",""))[:400],
+    ("description", str(left.get("description",""))[:400],
                  str(right.get("description",""))[:400]),
                 ]
-        _df = pd.DataFrame(rows, columns=["字段", "A", "B"])
+        _df = pd.DataFrame(rows, columns=["field", "A", "B"])
         st.dataframe(_df, use_container_width=True, hide_index=True)
-        st.info("提示：当前仅提供对比视图；CrewAI 裁判与打分将在下一步接入。")
+        st.info("Note: Currently, only the comparison view is available; CrewAI judging and scoring will be added in the next step.")
 
 # =====================
 # Model / Data Loading (use your HF repo with cleaned data)
@@ -193,7 +193,7 @@ def rerank_by_similarity(query, results, model, top_n=5):
 # UI
 # =====================
 st.title("\U0001F50D Amazon Cell Phone Product Search")
-st.caption("Dense retrieval + Top5 对比面板（清洗后、无图片依赖）")
+st.caption("Dense retrieval + Top 5 Comparison Panel (after cleaning, no image dependency)")
 
 model = load_model()
 df_all, index = load_data()  # 已是清洗后数据，无需再次清洗
@@ -224,4 +224,4 @@ if query:
         top5_results = tmp.head(5).to_dict(orient="records")
         render_top5_with_compare(top5_results, query)
 else:
-    st.info("请输入查询词开始搜索（例如：oneplus 7t case / note 5 leather case）")
+    st.info("Please enter your search terms to begin searching.（For example：oneplus 7t case / note 5 leather case）")
