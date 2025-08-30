@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-# app1.py  — 搜索/Top5/对比 + 对比后 AI 评审（深色主题可读性 + pill 高亮稳定版）
-
 import os
 import re
 import ast
