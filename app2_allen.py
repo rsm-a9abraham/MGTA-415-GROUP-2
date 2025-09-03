@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
-# app2_allen.py — Gemini-first chat app (everything Gemini, grounded on your dataset)
-# - Small talk: Gemini (explicitly instructed to avoid products unless asked)
-# - Shopping: Gemini with dataset bullets (numbered, spaced), or local fallback if Gemini fails
-# - HF shards (parquet + faiss)
-# - Gemini key from allen_apikey.txt
-# - Mini green/red badges, numbered bullets, comparison flow continues
-# - Top-right Reload app (full clear), bottom-right Reset conversation (chat only)
-# Run: PYTHONNOUSERSITE=1 streamlit run app2_allen.py --server.port 8501
+# app2_allen.py — Gemini-first Customer Intelligence Tool (single follow-up prompt)
 
 import os, re, ast, sys, platform, urllib.request
 from typing import Optional, Tuple, List
@@ -18,7 +11,7 @@ import pandas as pd
 import streamlit as st
 from streamlit.components.v1 import html as st_html
 
-st.set_page_config(page_title="📱 Bot", layout="wide")
+st.set_page_config(page_title="📱 Customer Intelligence Tool", layout="wide")
 
 # ---------------------- Styles ----------------------
 st.markdown("""
@@ -28,15 +21,15 @@ st.markdown("""
 .badge-mini.ok { background: #10b98122; border-color:#10b98155; color:#10b981; }
 .badge-mini.err{ background: #ef444422; border-color:#ef444480; color:#ef4444; }
 
-/* Comparison table: stronger contrast */
+/* Comparison table (page-level styles; iframe has its own) */
 .cmp-table { width:100%; border-collapse:separate; border-spacing:0 10px; }
 .cmp-row { background: rgba(148,163,184,0.10); border:1px solid rgba(148,163,184,0.38); }
 .cmp-row td { padding:12px 14px; }
 .cmp-row:hover { background: rgba(255,255,255,0.08); }
-.cmp-key { width:160px; color:#e5e7eb; font-weight:700; }
-.cmp-val { border-left:1px dashed rgba(148,163,184,0.45); color:#f8fafc; }
+.cmp-key { width:180px; font-weight:700; }
+.cmp-val { border-left:1px dashed rgba(148,163,184,0.45); }
 .win-pill { display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px;
-            background:rgba(16,185,129,0.22); border:1px solid rgba(16,185,129,0.65); font-weight:700; }
+            background:rgba(16,185,129,0.22); border:1px solid rgba(16,185,129,0.65); font-weight:700; color:#10b981; }
 .win-pill::after { content:"✓"; font-size:12px; }
 
 /* Normalize LLM typography */
@@ -45,13 +38,19 @@ st.markdown("""
   font-size: 16px !important;
   line-height: 1.55 !important;
 }
+
+/* Suggestion chips */
+.suggest-row { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 0 0; }
+.suggest { font-size:12px; padding:6px 10px; border-radius:999px; border:1px solid rgba(148,163,184,0.35);
+           background:rgba(148,163,184,0.12); cursor: pointer; }
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------------- Header + Reload ----------------------
 col_title, col_btn = st.columns([0.84, 0.16])
 with col_title:
-    st.title("💬 Customer Intelligence Tool (Cellphones-2023 Dataset)")
-    st.caption("Gemini-first assistant — small talk & shopping; shopping grounded on HF dataset")
+    st.title("💬 Customer Intelligence Tool (Cellphones & Accessories)")
+    st.caption("Gemini-first assistant — small talk & shopping; shopping grounded on the HF dataset")
 with col_btn:
     def hard_reload():
         try:
@@ -73,6 +72,31 @@ def badge(msg: str, ok: bool = True):
     c = "ok" if ok else "err"
     st.markdown(f"""<div class="badge-row"><div class="badge-mini {c}">{escape(msg)}</div></div>""",
                 unsafe_allow_html=True)
+
+# ---------------------- Identity & single follow-up prompt ----------------------
+BOT_IDENTITY = (
+    "You are the **Customer Intelligence Tool** for **cellphones and accessories**. "
+    "You help users find, compare, and recommend products using the curated catalog. "
+    "Be warm, concise, and helpful. In small talk, do not suggest products unless asked."
+)
+ASSISTANT_PROMPT = "What can I help you with today?"
+
+# Only non-compare chips at start; compare chips appear AFTER results exist
+QUICK_CHIPS_BASE = [
+    "best iPhone 14 case under $20",
+    "thin MagSafe case",
+    "Pixel 7 screen protector",
+]
+
+def get_quick_chips():
+    chips = QUICK_CHIPS_BASE.copy()
+    top = st.session_state.get("last_top5") or []
+    n = len(top)
+    if n >= 2:
+        chips.append("compare 1 & 2")
+        if n >= 3:
+            chips.append("compare 1 & 3")
+    return chips
 
 # ---------------------- Key loading ----------------------
 def load_api_key_from_file(path: str = "allen_apikey.txt") -> Optional[str]:
@@ -189,7 +213,22 @@ def as_list(x):
         return [x]
     return []
 
-# ---------------------- Compare rendering ----------------------
+def append_prompt_once(text: str) -> str:
+    """Append ASSISTANT_PROMPT only if a similar line isn't already present."""
+    norm = re.sub(r'[^a-z]+', ' ', (text or '').lower()).strip()
+    already = [
+        "what can i help you with today",
+        "how can i help you today",
+        "how may i help you today",
+        "how can i help you",
+        "how may i help you",
+        "what can i do for you today",
+    ]
+    if any(p in norm for p in already):
+        return text
+    return (text or "").rstrip() + "\n\n_" + ASSISTANT_PROMPT + "_"
+
+# ---------------------- Compare rendering (iframe with its own CSS) ----------------------
 def render_pretty_compare(left: dict, right: dict):
     def _pval(p):
         v = p.get("price_float") if "price_float" in p else p.get("display_price")
@@ -218,19 +257,40 @@ def render_pretty_compare(left: dict, right: dict):
     la, lb = left.get("rating_number"), right.get("rating_number")
     better_vol = "A" if (isinstance(la,(int,np.integer)) and isinstance(lb,(int,np.integer)) and la > lb) else ("B" if (isinstance(la,(int,np.integer)) and isinstance(lb,(int,np.integer)) and lb > la) else None)
 
-    a_brand = left.get("store") or left.get("brand_clean") or ""
-    b_brand = right.get("store") or right.get("brand_clean") or ""
+    a_brand = left.get("store") or left.get("brand_clean") or "—"
+    b_brand = right.get("store") or right.get("brand_clean") or "—"
     a_feat = ", ".join(map(str, as_list(left.get("features", []))[:8])) or "—"
     b_feat = ", ".join(map(str, as_list(right.get("features", []))[:8])) or "—"
-    a_desc = str(left.get("description", ""))[:400] or "—"
-    b_desc = str(right.get("description", ""))[:400] or "—"
+    a_desc = (str(left.get("description", ""))[:400] or "—")
+    b_desc = (str(right.get("description", ""))[:400] or "—")
 
     html = f"""
+    <style>
+      /* Light, readable look inside the iframe so it's theme-agnostic */
+      html, body {{
+        background: #ffffff;
+        color: #111827;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        margin: 0;
+        padding: 0;
+      }}
+      .cmp-table {{ width:100%; border-collapse:separate; border-spacing:0 10px; }}
+      .cmp-row {{ background:#ffffff; border:1px solid rgba(0,0,0,0.12); border-radius:10px; }}
+      .cmp-row:hover {{ background:#f9fafb; }}
+      .cmp-row td {{ padding:12px 14px; vertical-align:top; }}
+      .cmp-key {{ width:180px; color:#374151; font-weight:700; }}
+      .cmp-val {{ border-left:1px dashed rgba(0,0,0,0.16); color:#111827; }}
+      .win-pill {{
+        display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px;
+        background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.45); font-weight:700; color:#047857;
+      }}
+      .win-pill::after {{ content:"✓"; font-size:12px; }}
+    </style>
     <table class="cmp-table">
       {row("price", price_str(lp), price_str(rp), better_price)}
       {row("average_rating", left.get("average_rating","N/A"), right.get("average_rating","N/A"), better_rate)}
       {row("rating_number", la or 'N/A', lb or 'N/A', better_vol)}
-      {row("brand/store", a_brand or '—', b_brand or '—', None)}
+      {row("brand/store", a_brand, b_brand, None)}
       {row("features", a_feat, b_feat, None)}
       {row("description", a_desc, b_desc, None)}
     </table>
@@ -329,7 +389,7 @@ def rerank_by_similarity(query: str, results: pd.DataFrame, model, top_n=5) -> p
     out["similarity_score"] = sims
     return out.sort_values("similarity_score", ascending=False).head(top_n)
 
-# ---------------------- Intent & text actions ----------------------
+# ---------------------- Intent & actions ----------------------
 RE_COMPARE = re.compile(r"\b(?:compare|vs|versus)\b", re.I)
 RE_NUMPAIR = re.compile(r"\b([1-9]|10)\s*(?:&|and|,|\s)\s*([1-9]|10)\b")
 RE_LETTERPAIR = re.compile(r"\b([A-Ea-e])\s*(?:&|and|,|\s)\s*([A-Ea-e])\b")
@@ -339,14 +399,22 @@ RE_OVER  = re.compile(r"(?:over|above|greater than|higher than|>)\s*\$?\s*(\d+(?
 
 def is_small_talk(msg: str) -> bool:
     m = msg.lower().strip()
-    chat_keys = ["how are you", "how's it going", "hello", "hi", "hey", "what's up", "thank you", "thanks", "what is your name", "who are you"]
-    prod_keys = ["case","phone","iphone","samsung","pixel","android","accessory","charger","protector","magnet","battery","screen","otterbox","spigen","clear","wallet","wireless"]
+    chat_keys = [
+        "how are you", "how's it going", "hello", "hi", "hey", "what's up",
+        "thank you", "thanks", "what is your name", "who are you",
+        "what is this tool", "what are you", "tell me about yourself"
+    ]
+    prod_keys = ["case","phone","iphone","samsung","pixel","android","accessory","charger",
+                 "protector","magnet","battery","screen","otterbox","spigen","clear",
+                 "wallet","wireless"]
     return any(k in m for k in chat_keys) and not any(k in m for k in prod_keys) and not RE_COMPARE.search(m)
 
 def has_shopping_intent(msg: str) -> bool:
     m = msg.lower()
     if RE_COMPARE.search(m): return True
-    if any(k in m for k in ["best","recommend","suggest","option","pick","looking for","buy","budget","under","below","cheap","value","rating","reviews","protect","thin","slim","leather","mag-safe","magsafe","kickstand"]):
+    if any(k in m for k in ["best","recommend","suggest","option","pick","looking for","buy",
+                            "budget","under","below","cheap","value","rating","reviews","protect",
+                            "thin","slim","leather","mag-safe","magsafe","kickstand"]):
         return True
     if "$" in m or re.search(r"\b\d+\s?(?:stars?|reviews?)\b", m):
         return True
@@ -367,6 +435,9 @@ def parse_pair(text: str, top_len: int) -> Tuple[Optional[int], Optional[int]]:
     return None, None
 
 def apply_text_action(user_msg: str, df: pd.DataFrame):
+    """Apply filter/sort actions inferred from text.
+       NOTE: 'sort by value' is DISABLED by request.
+    """
     msg = user_msg.lower()
     df = ensure_price_float(df)
     r = RE_PRICE_RANGE.search(msg)
@@ -393,15 +464,13 @@ def apply_text_action(user_msg: str, df: pd.DataFrame):
             return df.sort_values("average_rating", ascending=False).copy(), "Sorted by rating (highest→lowest)."
         if "review" in msg:
             return df.sort_values("rating_number", ascending=False).copy(), "Sorted by reviews (most→least)."
-        if "value" in msg and "average_rating" in df.columns:
-            tmp = df.copy()
-            tmp["value_score"] = tmp["average_rating"] / tmp["price_float"].replace(0,np.nan)
-            return tmp.sort_values(["value_score","average_rating","rating_number"], ascending=[False,False,False]).copy(), "Sorted by value (rating/price)."
+        if "value" in msg:
+            # Disabled: keep dataset as-is and inform the user.
+            return df.copy(), "Note: sorting by value is disabled."
     return df, None
 
-# ---------------------- Gemini helpers (everything via Gemini) ----------------------
+# ---------------------- Gemini helpers ----------------------
 def g_call(system_instruction: str, user_text: str) -> str:
-    """Robust Gemini call with non-empty fallback string."""
     if not GEMINI_OK:
         return ""
     try:
@@ -409,7 +478,6 @@ def g_call(system_instruction: str, user_text: str) -> str:
         out = m.generate_content(user_text)
         txt = (out.text or "").strip()
         if not txt:
-            # retry once with a nudge
             out2 = m.generate_content(user_text + "\n\nPlease answer naturally in 1–3 sentences.")
             txt = (out2.text or "").strip()
         return sanitize_md(txt) if txt else ""
@@ -418,38 +486,27 @@ def g_call(system_instruction: str, user_text: str) -> str:
         return ""
 
 def g_smalltalk(user_msg: str) -> str:
-    sys = ("You are a warm, concise assistant. This is small talk only — "
-           "do not suggest products unless the user asks about shopping. "
-           "Respond in 1–3 sentences.")
+    sys = (
+        f"{BOT_IDENTITY} "
+        "This is small talk only — do not suggest products unless the user asks about shopping. "
+        "Respond in 1–3 sentences. Do not add closing prompts like “How can I help you today?”"
+    )
     txt = g_call(sys, user_msg)
     if txt:
-        return txt
-    # final fallback (never 'Okay!')
+        return append_prompt_once(txt)
+
     m = user_msg.lower()
-    if "name" in m: return "I’m your shopping assistant."
+    if "name" in m or "what are you" in m or "what is this tool" in m:
+        return append_prompt_once("I’m the Customer Intelligence Tool for cellphones and accessories.")
     if any(x in m for x in ["how are you", "how's it going", "how are u"]):
-        return "I’m doing great—thanks! What can I help you find today?"
+        return append_prompt_once("I’m doing great—thanks!")
     if any(x in m for x in ["hello", "hi", "hey", "what's up"]):
-        return "Hi there! What are you shopping for today?"
+        return append_prompt_once("Hi there!")
     if any(x in m for x in ["thanks", "thank you", "thx"]):
-        return "You’re welcome! Need anything else?"
-    return "I’m here! Tell me what you’re looking for and I’ll help."
+        return append_prompt_once("You’re welcome!")
+    return append_prompt_once("I’m here to help.")
 
-def g_grounded_list(user_msg: str, numbered_bullets: List[str]) -> str:
-    """Ask Gemini to present numbered bullets with blank lines — using only provided bullets."""
-    if not GEMINI_OK or not numbered_bullets:
-        return ""
-    sys = ("You are a helpful shopping assistant. Use ONLY the provided catalog bullets. "
-           "Present at least 3 items as **numbered bullets** (1., 2., 3., …), "
-           "with a blank line between bullets. Keep it concise.")
-    txt = g_call(sys, user_msg + "\n\n" + "\n".join(numbered_bullets))
-    if not txt:
-        return ""
-    # ensure spacing between numbered bullets
-    txt = re.sub(r"\n(\d+\.)", r"\n\n\\1", txt).lstrip()
-    return txt
-
-def bullets_from_df(df: pd.DataFrame, limit=6) -> List[str]:
+def bullets_from_df(df: pd.DataFrame, limit=5) -> List[str]:
     out=[]
     df = ensure_price_float(df)
     for i, (_, r) in enumerate(df.head(limit).iterrows(), 1):
@@ -478,11 +535,24 @@ for m in st.session_state.chat:
     with st.chat_message(role) if hasattr(st, "chat_message") else st.container():
         st.markdown(m.get("content",""))
 
-# Welcome
+# Welcome (no compare / no sort examples)
 if not st.session_state.chat:
-    hello = "Hi! Ask me anything — e.g., **best under $20**, **thin iPhone 14 case**, **compare 2 & 5**, **sort by value**."
+    hello = (
+        "Hi! I’m the **Customer Intelligence Tool** for **cellphones & accessories**. "
+        "Ask naturally — e.g., **best under $20**, **thin iPhone 14 case**, **Pixel 7 screen protector**."
+    )
     st.session_state.chat.append({"role":"assistant","content":hello})
     with st.chat_message("assistant"): st.markdown(hello)
+
+# Quick prompt chips (compare chips appear only after results exist)
+chips_to_show = get_quick_chips()
+st.markdown('<div class="suggest-row">', unsafe_allow_html=True)
+chip_cols = st.columns(len(chips_to_show))
+chip_clicked_text = None
+for i, label in enumerate(chips_to_show):
+    if chip_cols[i].button(label, key=f"suggest_{i}"):
+        chip_clicked_text = label
+st.markdown('</div>', unsafe_allow_html=True)
 
 # Bottom-right Reset conversation button
 with st.container():
@@ -492,8 +562,10 @@ with st.container():
             reset_conversation()
             st.rerun()
 
-# ---------------------- Main chat loop ----------------------
-user_msg = st.chat_input("Ask naturally… I’ll search when needed (e.g., “best under $20”, “compare 2 & 5”).")
+# ---------------------- Main chat ----------------------
+user_msg = chip_clicked_text or st.chat_input(
+    "Ask naturally… I’ll search when needed (e.g., “best under $20”, “thin iPhone 14 case”)."
+)
 
 def handle_compare_request(user_msg: str) -> bool:
     i, j = parse_pair(user_msg, len(st.session_state.last_top5))
@@ -520,7 +592,7 @@ def run_retrieval_and_reply(user_msg: str):
         res = search_all_shards(user_msg, model, dfs, idxs, top_k_per=12, final_top=48)
     if res.empty:
         msg = g_call(
-            "You are kind and concise. Explain there are no catalog matches and suggest trying different keywords.",
+            f"{BOT_IDENTITY} Explain there are no catalog matches and suggest different keywords (1–2 sentences).",
             user_msg
         ) or "I couldn’t find matches in the catalog. Try different keywords?"
         st.session_state.chat.append({"role":"assistant","content":msg})
@@ -528,7 +600,14 @@ def run_retrieval_and_reply(user_msg: str):
         return
 
     res = ensure_price_float(res)
-    top = rerank_by_similarity(user_msg, res, model, top_n=5)
+    pool, summary = apply_text_action(user_msg, res)
+    if pool is None or pool.empty:
+        pool = res
+
+    top = rerank_by_similarity(user_msg, pool, model, top_n=5)
+    if len(top) < 3:
+        extra = pool[~pool.index.isin(top.index)].head(3 - len(top))
+        top = pd.concat([top, extra], axis=0)
 
     tmp = top.copy()
     tmp["price"] = tmp.get("display_price", "N/A")
@@ -541,27 +620,17 @@ def run_retrieval_and_reply(user_msg: str):
         tmp["store"] = tmp["brand_clean"]
     st.session_state.last_top5 = tmp.to_dict(orient="records")
 
-    acted_df, summary = apply_text_action(user_msg, res)
-    bullets_src = acted_df if not acted_df.empty else res
-    numbered = bullets_from_df(bullets_src, limit=max(5, min(6, len(bullets_src))))
-    # ask Gemini to format the numbered list (at least 3, blank line spacing)
-    grounded = g_grounded_list(user_msg, numbered)
-    if grounded.strip():
-        blines = grounded
-    else:
-        # local fallback
-        fallback_list = bullets_from_df(tmp if len(tmp) >= 3 else res, limit=max(3, min(6, len(res))))
-        blines = "\n\n".join(fallback_list)
+    enumerated = bullets_from_df(tmp, limit=max(3, min(5, len(tmp))))
 
     pre = g_call(
-        "You are a concise, friendly shopping assistant. Acknowledge the request in 1 sentence.",
+        f"{BOT_IDENTITY} Acknowledge the user in 1 sentence.",
         user_msg
     ) or "Here are good options I found."
     if summary: pre += "\n\n" + summary
 
-    tail = ("\n\nI can compare any two — e.g., **2 & 5**.\n\n"
-            "**Anything else I can help you with?**")
-    final = pre + ("\n\n" if blines else "") + blines + tail
+    tail = ("\n\nI can compare any two — e.g., **1 & 3**.\n\n"
+            f"_{ASSISTANT_PROMPT}_")
+    final = pre + "\n\n" + "\n\n".join(enumerated) + tail
 
     st.session_state.chat.append({"role":"assistant","content":final})
     with st.chat_message("assistant"): st.markdown(final)
@@ -571,33 +640,23 @@ try:
         st.session_state.chat.append({"role":"user","content":user_msg})
         with st.chat_message("user"): st.markdown(user_msg)
 
-        # 1) If user references previous results to compare
         if handle_compare_request(user_msg):
             pass
-
-        # 2) Shopping intent → retrieval + Gemini-grounded list
         elif has_shopping_intent(user_msg) and model is not None and dfs and idxs:
             run_retrieval_and_reply(user_msg)
-
-        # 3) Small talk (Gemini-based, but no products)
         elif is_small_talk(user_msg):
             reply = g_smalltalk(user_msg)
             st.session_state.chat.append({"role":"assistant","content":reply})
             with st.chat_message("assistant"): st.markdown(reply)
-
-        # 4) Fallback (Gemini reply; if no catalog available and not small talk, explain)
         else:
-            if not (model and dfs and idxs):
-                reply = g_call(
-                    "You are helpful and concise. Explain you can chat, but catalog access is currently unavailable.",
-                    user_msg
-                ) or "I’m here to help — but I can’t access the catalog right now."
-            else:
-                reply = g_smalltalk(user_msg)
+            reply = g_call(
+                f"{BOT_IDENTITY} If the user intent is unclear, kindly ask a brief follow-up. 1–2 sentences.",
+                user_msg
+            ) or "I’m here to help."
+            reply = append_prompt_once(reply)  # ensure only one closing prompt
             st.session_state.chat.append({"role":"assistant","content":reply})
             with st.chat_message("assistant"): st.markdown(reply)
 
 except Exception as e:
     st.error(f"Something went wrong handling your last message: {e}")
     st.info("You can keep chatting or tap **Reload app** (top-right) to fully restart.")
-
