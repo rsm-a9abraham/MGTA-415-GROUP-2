@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-# app1.py — Amazon Cell Phone Product Search + Gemini-first Chat (robust)
-# Notes:
-# - Shows "✅ App loaded" immediately so you know the UI is rendering.
-# - Safe fallbacks: older Streamlit (no st.chat_input), missing crew_judge_module, Gemini off, etc.
-# - Errors during data/model load are shown in the page (no silent blank).
-# Run:   streamlit run app1.py
+# app2_allen.py — Gemini-first chat app (everything Gemini, grounded on your dataset)
+# - Small talk: Gemini (explicitly instructed to avoid products unless asked)
+# - Shopping: Gemini with dataset bullets (numbered, spaced), or local fallback if Gemini fails
+# - HF shards (parquet + faiss)
+# - Gemini key from allen_apikey.txt
+# - Mini green/red badges, numbered bullets, comparison flow continues
+# - Top-right Reload app (full clear), bottom-right Reset conversation (chat only)
+# Run: PYTHONNOUSERSITE=1 streamlit run app2_allen.py --server.port 8501
 
-import os, re, ast, json, sys, platform, urllib.request
-from typing import Optional, Tuple, List, Dict
+import os, re, ast, sys, platform, urllib.request
+from typing import Optional, Tuple, List
 from html import escape
 
 import numpy as np
@@ -16,44 +18,99 @@ import pandas as pd
 import streamlit as st
 from streamlit.components.v1 import html as st_html
 
-# ─────────────────────────────────────────────────────────
-# Page setup FIRST so UI renders even if later steps fail
-# ─────────────────────────────────────────────────────────
-st.set_page_config(page_title="📱 Amazon Cell Phone Product Search", layout="wide")
-st.title("🔍 Amazon Cell Phone Product Search")
-st.caption("Dense retrieval + Top 5 Comparison Panel + 💬 Gemini chat (grounded on your dataset)")
-st.success("✅ App loaded (UI is running)")  # early indicator so you never see a blank page
+st.set_page_config(page_title="📱 Bot", layout="wide")
 
-# ─────────────────────────────────────────────────────────
-# Debug info (minimal, collapsible)
-# ─────────────────────────────────────────────────────────
-with st.expander("Diagnostics"):
-    st.write({
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        "streamlit": st.__version__,
-    })
+# ---------------------- Styles ----------------------
+st.markdown("""
+<style>
+.badge-row { display:flex; flex-wrap:wrap; gap:10px; margin:6px 0 0 0; }
+.badge-mini { font-size:12px; padding:6px 10px; border-radius:10px; border:1px solid transparent; }
+.badge-mini.ok { background: #10b98122; border-color:#10b98155; color:#10b981; }
+.badge-mini.err{ background: #ef444422; border-color:#ef444480; color:#ef4444; }
 
-# ─────────────────────────────────────────────────────────
-# 🔑 HARD-CODE YOUR GEMINI KEY HERE
-# ─────────────────────────────────────────────────────────
-GOOGLE_API_KEY = "AIzaSyCcMoX7rNRmg6VWvN7o2gOi8-BkXvBRvwI"   # ← replace this
-os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+/* Comparison table: stronger contrast */
+.cmp-table { width:100%; border-collapse:separate; border-spacing:0 10px; }
+.cmp-row { background: rgba(148,163,184,0.10); border:1px solid rgba(148,163,184,0.38); }
+.cmp-row td { padding:12px 14px; }
+.cmp-row:hover { background: rgba(255,255,255,0.08); }
+.cmp-key { width:160px; color:#e5e7eb; font-weight:700; }
+.cmp-val { border-left:1px dashed rgba(148,163,184,0.45); color:#f8fafc; }
+.win-pill { display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px;
+            background:rgba(16,185,129,0.22); border:1px solid rgba(16,185,129,0.65); font-weight:700; }
+.win-pill::after { content:"✓"; font-size:12px; }
 
-# Gemini: import non-fatal
+/* Normalize LLM typography */
+.stChatMessage, .stMarkdown p, .stMarkdown li, .stMarkdown {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji" !important;
+  font-size: 16px !important;
+  line-height: 1.55 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+col_title, col_btn = st.columns([0.84, 0.16])
+with col_title:
+    st.title("💬 Customer Intelligence Tool (Cellphones-2023 Dataset)")
+    st.caption("Gemini-first assistant — small talk & shopping; shopping grounded on HF dataset")
+with col_btn:
+    def hard_reload():
+        try:
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+        except Exception:
+            pass
+        try: st.cache_data.clear()
+        except Exception: pass
+        try: st.cache_resource.clear()
+        except Exception: pass
+        st.rerun()
+    if st.button("🔁 Reload app", help="Fully clear caches and restart the app", use_container_width=True):
+        hard_reload()
+
+st.success("✅ App Working")
+
+def badge(msg: str, ok: bool = True):
+    c = "ok" if ok else "err"
+    st.markdown(f"""<div class="badge-row"><div class="badge-mini {c}">{escape(msg)}</div></div>""",
+                unsafe_allow_html=True)
+
+# ---------------------- Key loading ----------------------
+def load_api_key_from_file(path: str = "allen_apikey.txt") -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                if s.upper().startswith("GOOGLE_API_KEY="):
+                    return s.split("=", 1)[1].strip()
+                return s
+    except Exception:
+        return None
+
+GEMINI_OK = False
+GEM_MODEL = "gemini-1.5-flash"
+API_KEY = load_api_key_from_file()
+if API_KEY:
+    os.environ["GOOGLE_API_KEY"] = API_KEY
 try:
     import google.generativeai as genai
-    genai.configure(api_key=GOOGLE_API_KEY)
-    GEMINI_OK = True
-except Exception as _ge:
-    GEMINI_OK = False
-    st.warning(f"Gemini not active: {_ge}")
+    if API_KEY:
+        genai.configure(api_key=API_KEY)
+        GEMINI_OK = True
+        badge("Gemini connected", ok=True)
+    else:
+        badge("Gemini key file not found (allen_apikey.txt).", ok=False)
+except Exception as e:
+    badge(f"Gemini not active: {e}", ok=False)
 
-# Try judge module, otherwise fallback
+# ---------------------- Judge (optional) ----------------------
 try:
-    from crew_judge_module import judge_products, render_streamlit_card  # optional
+    from crew_judge_module import judge_products, render_streamlit_card
 except Exception:
-    def judge_products(query, left, right, use_crewai=True, model="gemini-1.5-flash"):
+    def judge_products(query, left, right, use_crewai=True, model=GEM_MODEL):
         def val(p):
             try:
                 pr = float(p.get("price_float") or np.inf)
@@ -62,64 +119,61 @@ except Exception:
             except Exception:
                 return 0.0
         a, b = val(left), val(right)
-        return {
-            "title": "Local Verdict",
-            "winner": "A" if a >= b else "B",
-            "reasoning": f"Value scores — A:{a:.3f} vs B:{b:.3f} (higher is better)"
-        }
-
+        return {"title": "Local Verdict", "winner": "A" if a >= b else "B",
+                "reasoning": f"Value scores — A:{a:.3f} vs B:{b:.3f}"}
     def render_streamlit_card(result: dict):
         st.success(f"**{result.get('title','Verdict')}** → Winner: **{result.get('winner','A/B')}**")
         if result.get("reasoning"):
-            st.write(result["reasoning"])
+            st.caption(result["reasoning"])
 
-# ─────────────────────────────────────────────────────────
-# Styles
-# ─────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-  .prd-card {border-radius:16px; padding:14px 16px; margin:10px 0;
-             border:1px solid rgba(148,163,184,0.25);
-             background: rgba(148,163,184,0.06);}
-  .prd-card:hover {border-color:#7C9CFF; box-shadow:0 4px 14px rgba(124,156,255,0.15);}
-  .prd-title {font-size:15px; line-height:1.35; margin:0 0 6px 0; font-weight:600;}
-  .badges {display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 2px 0;}
-  .badge {padding:2px 8px; border-radius:999px; border:1px solid rgba(148,163,184,0.35); font-size:12px;}
-  .badge.price  {background:#10b98122; color:#10b981; border-color:#10b98155;}
-  .badge.rating {background:#f59e0b22; color:#f59e0b; border-color:#f59e0b55;}
-  .badge.brand  {background:#60a5fa22; color:#60a5fa; border-color:#60a5fa55;}
-  .chips {display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;}
-  .chip {font-size:12px; padding:2px 8px; border-radius:999px;
-         border:1px solid rgba(148,163,184,0.35); background:rgba(148,163,184,0.12);}
-
-  .cmp-table { width:100%; border-collapse:separate; border-spacing:0 10px; }
-  .cmp-row { background: transparent; border:1px solid rgba(148,163,184,0.18); }
-  .cmp-row td { padding:10px 12px; }
-  .cmp-row:hover { background: rgba(255,255,255,0.03); }
-  .cmp-key { width:160px; color:#f1f5f9; font-weight:600; }
-  .cmp-val { border-left:1px dashed rgba(148,163,184,0.25); color:#f8fafc; }
-
-  .win-pill { display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border-radius:999px;
-              background:rgba(16,185,129,0.18); border:1px solid rgba(16,185,129,0.55); font-weight:600; }
-  .win-pill::after { content:"✓"; font-size:12px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────
-# Imports that can be heavy (wrapped so errors show on page)
-# ─────────────────────────────────────────────────────────
+# ---------------------- Heavy deps ----------------------
+HEAVY_OK = True
 try:
     import faiss
     from sentence_transformers import SentenceTransformer
-    from sentence_transformers.util import cos_sim
-    HEAVY_OK = True
+    from sentence_transformers.util import cos_sim as _cos_sim
 except Exception as e:
     HEAVY_OK = False
-    st.error(f"Failed to import FAISS / SentenceTransformer: {e}")
+    badge(f"Failed to import FAISS / SentenceTransformer: {e}", ok=False)
 
-# ─────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────
+# ---------------------- Utils ----------------------
+def price_str(v) -> str:
+    try:
+        if isinstance(v, (int, float, np.floating)) and not pd.isna(v):
+            return f"${float(v):.2f}"
+        if isinstance(v, str):
+            m = re.search(r"[-+]?\d*\.?\d+", v)
+            if m:
+                return f"${float(m.group()):.2f}"
+    except Exception:
+        pass
+    return "N/A"
+
+def sanitize_md(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"</?[^>]+>", "", s)
+    s = s.replace("`", "")
+    s = re.sub(r"[_*~]+", "", s)
+    s = s.replace("\u200b", "").replace("\u200c", "").replace("\ufeff", "")
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    return s.strip()
+
+def ensure_price_float(df: pd.DataFrame) -> pd.DataFrame:
+    if "price_float" in df.columns:
+        return df
+    def _coerce(x):
+        if isinstance(x, (int, float, np.floating)) and not pd.isna(x): return float(x)
+        if isinstance(x, str):
+            m = re.search(r"[-+]?\d*\.?\d+", x)
+            if m:
+                try: return float(m.group())
+                except: return np.nan
+        return np.nan
+    df = df.copy()
+    df["price_float"] = df.get("display_price", np.nan).map(_coerce)
+    return df
+
 def as_list(x):
     if isinstance(x, (list, tuple)):
         return list(x)
@@ -135,74 +189,17 @@ def as_list(x):
         return [x]
     return []
 
-def as_scalar(x):
-    if isinstance(x, (list, tuple)):
-        return x[0] if x else None
-    if isinstance(x, (np.ndarray, pd.Series)):
-        arr = x.tolist()
-        return arr[0] if arr else None
-    return x
-
-def _fmt_price_str(p: dict) -> str:
-    pf = as_scalar(p.get("price_float"))
-    if isinstance(pf, (int, float, np.floating)) and not pd.isna(pf):
-        return f"$ {float(pf):.2f}"
-    pr = p.get("price") or p.get("display_price")
-    if isinstance(pr, (int, float, np.floating)) and not pd.isna(pr):
-        return f"$ {float(pr):.2f}"
-    return str(pr) if pr not in (None, "", "None") else "N/A"
-
-def _price_value(p: dict) -> Optional[float]:
-    pf = as_scalar(p.get("price_float"))
-    if isinstance(pf, (int, float, np.floating)) and not pd.isna(pf):
-        return float(pf)
-    pr = p.get("price") or p.get("display_price")
-    if isinstance(pr, (int, float, np.floating)) and not pd.isna(pr):
-        return float(pr)
-    if isinstance(pr, str):
-        m = re.search(r"[-+]?\d*\.?\d+", pr)
-        if m:
-            try:
-                return float(m.group())
-            except Exception:
-                return None
-    return None
-
-def product_card_html(p: dict) -> str:
-    price = _fmt_price_str(p)
-    rating = as_scalar(p.get("average_rating"))
-    cnt = as_scalar(p.get("rating_number"))
-    brand = p.get("store") or p.get("brand_clean") or p.get("brand") or ""
-    cats = as_list(p.get("categories", []))[:3]
-    feats = as_list(p.get("features", []))[:4]
-    desc = str(p.get("description", ""))[:180]
-    badges = [
-        f"<span class='badge price'>💲 {escape(str(price))}</span>",
-        f"<span class='badge rating'>⭐ {escape(str(rating if rating not in (None,'') else 'N/A'))}{f' ({escape(str(cnt))})' if cnt not in (None,'') else ''}</span>",
-        f"<span class='badge brand'>🏷️ {escape(str(brand))}</span>" if brand else "",
-    ]
-    chips_html = "".join([f"<span class='chip'>{escape(str(c))}</span>" for c in [*cats,*feats]])
-    return f"""
-      <div class='prd-card'>
-        <div class='prd-title'>{escape(str(p.get('title','(Untitled)')))}</div>
-        <div class='badges'>{"".join(badges)}</div>
-        <div class='chips'>{chips_html}</div>
-        <div class='desc'>{escape(desc)}</div>
-      </div>
-    """
-
+# ---------------------- Compare rendering ----------------------
 def render_pretty_compare(left: dict, right: dict):
-    def _fmt_rate(p):
-        r = p.get("average_rating")
-        c = p.get("rating_number")
-        return f"{r} ({c})" if r not in (None, "") else "N/A"
-
-    lp, rp = _price_value(left), _price_value(right)
-    better_price = "A" if (lp is not None and rp is not None and lp < rp) else ("B" if (lp is not None and rp is not None and rp < lp) else None)
-    lr, rr = left.get("average_rating"), right.get("average_rating")
-    better_rate = "A" if (isinstance(lr, (int, float, np.floating)) and isinstance(rr, (int, float, np.floating)) and lr > rr) else ("B" if (isinstance(lr, (int, float, np.floating)) and isinstance(rr, (int, float, np.floating)) and rr > lr) else None)
-    la, lb = left.get("rating_number"), right.get("rating_number")
-    better_vol = "A" if (isinstance(la, (int, np.integer)) and isinstance(lb, (int, np.integer)) and la > lb) else ("B" if (isinstance(la, (int, np.integer)) and isinstance(lb, (int, np.integer)) and lb > la) else None)
+    def _pval(p):
+        v = p.get("price_float") if "price_float" in p else p.get("display_price")
+        try:
+            if isinstance(v, (int,float,np.floating)) and not pd.isna(v): return float(v)
+            if isinstance(v, str):
+                m = re.search(r"[-+]?\d*\.?\d+", v)
+                if m: return float(m.group())
+        except Exception: pass
+        return None
 
     def row(label, aval, bval, winner=None):
         acontent = f"<span class='win-pill'>{escape(str(aval))}</span>" if winner == "A" else escape(str(aval))
@@ -214,10 +211,15 @@ def render_pretty_compare(left: dict, right: dict):
           <td class="cmp-val">{bcontent}</td>
         </tr>"""
 
+    lp, rp = _pval(left), _pval(right)
+    better_price = "A" if (lp is not None and rp is not None and lp < rp) else ("B" if (lp is not None and rp is not None and rp < lp) else None)
+    lr, rr = left.get("average_rating"), right.get("average_rating")
+    better_rate = "A" if (isinstance(lr,(int,float,np.floating)) and isinstance(rr,(int,float,np.floating)) and lr > rr) else ("B" if (isinstance(lr,(int,float,np.floating)) and isinstance(rr,(int,float,np.floating)) and rr > lr) else None)
+    la, lb = left.get("rating_number"), right.get("rating_number")
+    better_vol = "A" if (isinstance(la,(int,np.integer)) and isinstance(lb,(int,np.integer)) and la > lb) else ("B" if (isinstance(la,(int,np.integer)) and isinstance(lb,(int,np.integer)) and lb > la) else None)
+
     a_brand = left.get("store") or left.get("brand_clean") or ""
     b_brand = right.get("store") or right.get("brand_clean") or ""
-    a_cats = ", ".join(map(str, as_list(left.get("categories", []))[:3])) or "—"
-    b_cats = ", ".join(map(str, as_list(right.get("categories", []))[:3])) or "—"
     a_feat = ", ".join(map(str, as_list(left.get("features", []))[:8])) or "—"
     b_feat = ", ".join(map(str, as_list(right.get("features", []))[:8])) or "—"
     a_desc = str(left.get("description", ""))[:400] or "—"
@@ -225,391 +227,377 @@ def render_pretty_compare(left: dict, right: dict):
 
     html = f"""
     <table class="cmp-table">
-      {row("price", _fmt_price_str(left), _fmt_price_str(right), better_price)}
-      {row("average_rating", _fmt_rate(left), _fmt_rate(right), better_rate)}
+      {row("price", price_str(lp), price_str(rp), better_price)}
+      {row("average_rating", left.get("average_rating","N/A"), right.get("average_rating","N/A"), better_rate)}
       {row("rating_number", la or 'N/A', lb or 'N/A', better_vol)}
       {row("brand/store", a_brand or '—', b_brand or '—', None)}
-      {row("categories", a_cats, b_cats, None)}
       {row("features", a_feat, b_feat, None)}
       {row("description", a_desc, b_desc, None)}
     </table>
     """
     st_html(html, height=420, scrolling=True)
 
-# ─────────────────────────────────────────────────────────
-# Heavy resources (model & data) with clear error output
-# ─────────────────────────────────────────────────────────
+# ---------------------- Encoder + HF shards ----------------------
 if HEAVY_OK:
     @st.cache_resource(show_spinner=True)
-    def load_model():
+    def load_encoder():
         return SentenceTransformer("all-MiniLM-L6-v2")
+    try:
+        model = load_encoder()
+        badge("Encoder: all-MiniLM-L6-v2 ready", ok=True)
+    except Exception as e:
+        model = None
+        badge(f"❌ Failed to load encoder: {e}", ok=False)
 else:
-    def load_model():
-        raise RuntimeError("SentenceTransformer import failed")
+    model = None
+
+HF_BASE = "https://huggingface.co/GovinKin/MGTA415database/resolve/main/"
+PARQUETS = [
+    "cellphones_clean_with_price000.parquet",
+    "cellphones_clean_with_price-0001.parquet",
+    "cellphones_clean_with_price-0002.parquet",
+    "cellphones_clean_with_price-0003.parquet",
+    "cellphones_clean_with_price-0004.parquet",
+    "cellphones_clean_with_price-0005.parquet",
+    "cellphones_clean_with_price-0006.parquet",
+]
+FAISS_FILES = [
+    "cellphones_with_price000.faiss",
+    "full-00001-of-00007.parquet.faiss",
+    "full-00002-of-00007.parquet.faiss",
+    "full-00003-of-00007.parquet.faiss",
+    "full-00004-of-00007.parquet.faiss",
+    "full-00005-of-00007.parquet.faiss",
+    "full-00006-of-00007.parquet.faiss",
+]
+
+def _download_if_missing(remote_url: str, local_name: str):
+    if os.path.exists(local_name):
+        return local_name
+    urllib.request.urlretrieve(remote_url + "?download=1", local_name)
+    return local_name
 
 @st.cache_data(show_spinner=True)
-def load_data():
-    parquet_url = (
-        "https://huggingface.co/GovinKin/MGTA415database/resolve/main/"
-        "cellphones_clean_with_price000.parquet?download=1"
-    )
-    df = pd.read_parquet(parquet_url)
+def load_shards():
+    dfs, idxs, total = [], [], 0
+    for pq, fx in zip(PARQUETS, FAISS_FILES):
+        pq_path = _download_if_missing(HF_BASE + pq, pq)
+        fx_path = _download_if_missing(HF_BASE + fx, fx)
+        df = pd.read_parquet(pq_path)
+        idx = faiss.read_index(fx_path)
+        dfs.append(df); idxs.append(idx); total += len(df)
+    return dfs, idxs, total
 
-    index_url = (
-        "https://huggingface.co/GovinKin/MGTA415database/resolve/main/"
-        "cellphones_with_price000.faiss?download=1"
-    )
-    local_index_path = "cellphones_with_price000.faiss"
-    if not os.path.exists(local_index_path):
-        urllib.request.urlretrieve(index_url, local_index_path)
-    index = faiss.read_index(local_index_path)
-    return df, index
-
-# Attempt loads (with messages instead of blank page)
+dfs, idxs, total_rows = [], [], 0
 try:
-    model = load_model()
-    st.info("Encoder: all-MiniLM-L6-v2 ready")
+    if HEAVY_OK:
+        dfs, idxs, total_rows = load_shards()
+        badge(f"Loaded {len(dfs)} shard pairs from HF ({total_rows:,} rows total).", ok=True)
+        badge(f"Dataset loaded: {total_rows:,} rows", ok=True)
+    else:
+        badge("❌ Skipped loading shards (FAISS/ST not imported).", ok=False)
 except Exception as e:
-    model = None
-    st.error(f"❌ Failed to load encoder: {e}")
+    badge(f"❌ Failed to load dataset/index bundle: {e}", ok=False)
 
-try:
-    df_all, index = load_data()
-    st.info(f"Dataset loaded: {len(df_all):,} rows")
-except Exception as e:
-    df_all, index = None, None
-    st.error(f"❌ Failed to load dataset/index: {e}\n"
-             f"Tips: ensure internet; `pip install pyarrow` for parquet; allow first-time downloads.")
-
-# ─────────────────────────────────────────────────────────
-# Retrieval helpers
-# ─────────────────────────────────────────────────────────
-def search(query, model, df, index, top_k=10):
+# ---------------------- Retrieval helpers ----------------------
+def search_all_shards(query: str, model, dfs: List[pd.DataFrame], idxs: List[faiss.Index],
+                      top_k_per=10, final_top=30) -> pd.DataFrame:
+    if model is None or not dfs or not idxs:
+        return pd.DataFrame()
     qv = model.encode([query]).astype("float32")
-    distances, indices = index.search(qv, k=top_k)
-    results = df.iloc[indices[0]].copy()
-    results["distance"] = distances[0]
-    return results
+    rows = []
+    for df, index in zip(dfs, idxs):
+        try:
+            D, I = index.search(qv, k=top_k_per)
+            sub = df.iloc[I[0]].copy()
+            sub["distance"] = D[0]
+            rows.append(sub)
+        except Exception:
+            continue
+    if not rows: return pd.DataFrame()
+    merged = pd.concat(rows, ignore_index=True)
+    merged = merged.sort_values("distance", ascending=True).head(final_top)
+    return merged
 
-def search_plus(query, model, df, index, top_k=30):
-    results = search(query, model, df, index, top_k=top_k)
-    lower_m = re.search(r"(above|over|more than|greater than|higher than)\s*\$?(\d+)", query.lower())
-    upper_m = re.search(r"(under|below|less than|cheaper than)\s*\$?(\d+)", query.lower())
-    lo = float(lower_m.group(2)) if lower_m else None
-    hi = float(upper_m.group(2)) if upper_m else None
-    if not results.empty and (lo is not None or hi is not None):
-        if "price_float" in results.columns:
-            if lo is not None: results = results[results["price_float"] > lo]
-            if hi is not None: results = results[results["price_float"] < hi]
-    stop_words = {"i","need","want","a","an","the","for","with","to","is","it","my","buy","on","of","and","in"}
-    kws = [kw for kw in query.lower().split() if kw not in stop_words and len(kw) > 2]
-    if not results.empty and kws:
-        pat = "|".join([re.escape(kw) for kw in kws])
-        results = results[results["title"].astype(str).str.lower().str.contains(pat, na=False)]
-    return results
-
-from sentence_transformers.util import cos_sim as _cos_sim  # already imported but keep explicit
-def rerank_by_similarity(query, results, model, top_n=5):
-    if results.empty: return results
+def rerank_by_similarity(query: str, results: pd.DataFrame, model, top_n=5) -> pd.DataFrame:
+    if results.empty or model is None: return results
     query_vec = model.encode([query], convert_to_tensor=True)
     titles = results["title"].astype(str).tolist()
     title_vecs = model.encode(titles, convert_to_tensor=True)
-    similarities = _cos_sim(query_vec, title_vecs)[0].cpu().numpy()
-    results = results.copy()
-    results["similarity_score"] = similarities
-    return results.sort_values("similarity_score", ascending=False).head(top_n)
+    sims = _cos_sim(query_vec, title_vecs)[0].cpu().numpy()
+    out = results.copy()
+    out["similarity_score"] = sims
+    return out.sort_values("similarity_score", ascending=False).head(top_n)
 
-# ─────────────────────────────────────────────────────────
-# Gemini helpers (safe)
-# ─────────────────────────────────────────────────────────
-def gemini_opening(user_msg: str, style="friendly & concise", emphasis="value over brand"):
-    if not GEMINI_OK:
-        return "Got it — I’ll help with that."
-    try:
-        m = genai.GenerativeModel(
-            "gemini-1.5-flash",
-            system_instruction=("You are a friendly, concise shopping assistant. "
-                                "Reply in 1–3 sentences. Acknowledge the user and say what you did/will do. "
-                                f"Tone: {style}. Emphasis: {emphasis}. No JSON.")
-        )
-        out = m.generate_content(user_msg)
-        return (out.text or "").strip() or "Okay!"
-    except Exception as e:
-        return "Okay!"
+# ---------------------- Intent & text actions ----------------------
+RE_COMPARE = re.compile(r"\b(?:compare|vs|versus)\b", re.I)
+RE_NUMPAIR = re.compile(r"\b([1-9]|10)\s*(?:&|and|,|\s)\s*([1-9]|10)\b")
+RE_LETTERPAIR = re.compile(r"\b([A-Ea-e])\s*(?:&|and|,|\s)\s*([A-Ea-e])\b")
+RE_PRICE_RANGE = re.compile(r"between\s*\$?\s*(\d+(?:\.\d+)?)\s*(?:and|to|-)\s*\$?\s*(\d+(?:\.\d+)?)", re.I)
+RE_UNDER = re.compile(r"(?:under|below|less than|cheaper than|<)\s*\$?\s*(\d+(?:\.\d+)?)", re.I)
+RE_OVER  = re.compile(r"(?:over|above|greater than|higher than|>)\s*\$?\s*(\d+(?:\.\d+)?)", re.I)
 
-def grounded_reply(user_msg: str, df_ctx: pd.DataFrame) -> str:
-    if not GEMINI_OK or df_ctx.empty:
-        return ""
-    try:
-        bullets=[]
-        for _, r in df_ctx.head(6).iterrows():
-            price = r.get("price_float")
-            price_s = f"${price:.2f}" if isinstance(price,(int,float,np.floating)) and not pd.isna(price) else "N/A"
-            rating = r.get("average_rating")
-            rating_s = f"{float(rating):.2f}" if pd.notna(rating) else "N/A"
-            reviews = r.get("rating_number")
-            reviews_s = f"{int(reviews):,}" if pd.notna(reviews) else "N/A"
-            bullets.append(f"- {str(r.get('title',''))[:90]} — {price_s}, ⭐ {rating_s} ({reviews_s})")
-        sys = "Use ONLY these catalog bullets to answer concisely (≤6 sentences). If nothing fits, say so politely.\n" + "\n".join(bullets)
-        m = genai.GenerativeModel("gemini-1.5-flash", system_instruction=sys)
-        out = m.generate_content(user_msg)
-        return (out.text or "").strip()
-    except Exception:
-        return ""
+def is_small_talk(msg: str) -> bool:
+    m = msg.lower().strip()
+    chat_keys = ["how are you", "how's it going", "hello", "hi", "hey", "what's up", "thank you", "thanks", "what is your name", "who are you"]
+    prod_keys = ["case","phone","iphone","samsung","pixel","android","accessory","charger","protector","magnet","battery","screen","otterbox","spigen","clear","wallet","wireless"]
+    return any(k in m for k in chat_keys) and not any(k in m for k in prod_keys) and not RE_COMPARE.search(m)
 
-# ─────────────────────────────────────────────────────────
-# Chat section (with fallback if old Streamlit)
-# ─────────────────────────────────────────────────────────
-LETTER_TO_INDEX = {c: i for i, c in enumerate(list("ABCDE"))}
+def has_shopping_intent(msg: str) -> bool:
+    m = msg.lower()
+    if RE_COMPARE.search(m): return True
+    if any(k in m for k in ["best","recommend","suggest","option","pick","looking for","buy","budget","under","below","cheap","value","rating","reviews","protect","thin","slim","leather","mag-safe","magsafe","kickstand"]):
+        return True
+    if "$" in m or re.search(r"\b\d+\s?(?:stars?|reviews?)\b", m):
+        return True
+    if any(k in m for k in ["case","phone","iphone","samsung","pixel","android","accessory","charger","protector"]):
+        return True
+    return False
 
-def parse_compare_nums(text: str, max_len: int) -> Tuple[Optional[int], Optional[int]]:
-    nums = re.findall(r"\b([1-9]|10)\b", text)
-    if len(nums) >= 2:
-        i, j = int(nums[0]) - 1, int(nums[1]) - 1
-        if 0 <= i < max_len and 0 <= j < max_len and i != j:
-            return i, j
-    letters = re.findall(r"\b([A-Ea-e])\b", text)
-    if len(letters) >= 2:
-        i, j = LETTER_TO_INDEX[letters[0].upper()], LETTER_TO_INDEX[letters[1].upper()]
-        if 0 <= i < max_len and 0 <= j < max_len and i != j:
-            return i, j
+def parse_pair(text: str, top_len: int) -> Tuple[Optional[int], Optional[int]]:
+    m = RE_NUMPAIR.search(text)
+    if m:
+        i, j = int(m.group(1))-1, int(m.group(2))-1
+        if 0 <= i < top_len and 0 <= j < top_len and i != j: return i, j
+    m = RE_LETTERPAIR.search(text)
+    if m:
+        mapL = {c:i for i,c in enumerate("ABCDE")}
+        i, j = mapL[m.group(1).upper()], mapL[m.group(2).upper()]
+        if 0 <= i < top_len and 0 <= j < top_len and i != j: return i, j
     return None, None
 
-def apply_text_action(user_msg: str, df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
-    m = user_msg.lower()
-    mt = re.search(r"between\s*\$?\s*(\d+(?:\.\d+)?)\s*(?:and|to|-)\s*\$?\s*(\d+(?:\.\d+)?)", m)
-    if mt and "price_float" in df.columns:
-        lo, hi = float(mt.group(1)), float(mt.group(2))
+def apply_text_action(user_msg: str, df: pd.DataFrame):
+    msg = user_msg.lower()
+    df = ensure_price_float(df)
+    r = RE_PRICE_RANGE.search(msg)
+    if r:
+        lo, hi = float(r.group(1)), float(r.group(2))
         if lo > hi: lo, hi = hi, lo
-        return df[(df["price_float"] >= lo) & (df["price_float"] <= hi)].copy(), f"Filtered between ${lo:.0f} and ${hi:.0f}."
-    if any(k in m for k in ["under","below","less than","cheaper than","<"]):
-        mt = re.search(r"\$?\s*(\d+(?:\.\d+)?)", m)
-        if mt and "price_float" in df.columns:
-            cap = float(mt.group(1)); return df[df["price_float"] < cap].copy(), f"Filtered under ${cap:.0f}."
-    if any(k in m for k in ["over","above","greater than","higher than",">"]):
-        mt = re.search(r"\$?\s*(\d+(?:\.\d+)?)", m)
-        if mt and "price_float" in df.columns:
-            lo = float(mt.group(1)); return df[df["price_float"] > lo].copy(), f"Filtered over ${lo:.0f}."
-    if "sort" in m:
-        if "price" in m and "price_float" in df.columns:
-            asc = "low" in m
-            return df.sort_values("price_float", ascending=asc).copy(), f"Sorted by price ({'lowest→highest' if asc else 'highest→lowest'})."
-        if "rating" in m and "average_rating" in df.columns:
+        flt = df[(df["price_float"] >= lo) & (df["price_float"] <= hi)].copy()
+        return flt, f"Filtered between ${lo:.0f} and ${hi:.0f}."
+    r = RE_UNDER.search(msg)
+    if r:
+        cap = float(r.group(1))
+        flt = df[df["price_float"] < cap].copy()
+        return flt, f"Filtered under ${cap:.0f}."
+    r = RE_OVER.search(msg)
+    if r:
+        lo = float(r.group(1))
+        flt = df[df["price_float"] > lo].copy()
+        return flt, f"Filtered over ${lo:.0f}."
+    if "sort" in msg:
+        if "price" in msg:
+            asc = "low" in msg or "asc" in msg
+            return df.sort_values("price_float", ascending=asc).copy(), f"Sorted by price ({'low→high' if asc else 'high→low'})."
+        if "rating" in msg:
             return df.sort_values("average_rating", ascending=False).copy(), "Sorted by rating (highest→lowest)."
-        if "review" in m and "rating_number" in df.columns:
+        if "review" in msg:
             return df.sort_values("rating_number", ascending=False).copy(), "Sorted by reviews (most→least)."
-        if "value" in m and all(c in df.columns for c in ["average_rating","price_float"]):
+        if "value" in msg and "average_rating" in df.columns:
             tmp = df.copy()
             tmp["value_score"] = tmp["average_rating"] / tmp["price_float"].replace(0,np.nan)
             return tmp.sort_values(["value_score","average_rating","rating_number"], ascending=[False,False,False]).copy(), "Sorted by value (rating/price)."
-    if any(k in m for k in ["recommend","best","suggest","pick for me"]):
-        cap = None
-        mt = re.search(r"\$?\s*(\d+(?:\.\d+)?)", m)
-        if mt: cap = float(mt.group(1))
-        tmp = df.copy()
-        if cap and "price_float" in tmp.columns:
-            tmp = tmp[tmp["price_float"] < cap]
-        if all(c in tmp.columns for c in ["average_rating","price_float"]):
-            tmp["value_score"] = tmp["average_rating"] / tmp["price_float"].replace(0,np.nan)
-            tmp = tmp.sort_values(["value_score","average_rating","rating_number"], ascending=[False,False,False]).head(3)
-        lines=[]
-        for _, r in tmp.iterrows():
-            price = r.get("price_float")
-            price_s = f"${price:.2f}" if isinstance(price,(int,float,np.floating)) and not pd.isna(price) else "N/A"
-            rating = r.get("average_rating")
-            rating_s = f"{float(rating):.2f}" if pd.notna(rating) else "N/A"
-            reviews = r.get("rating_number")
-            reviews_s = f"{int(reviews):,}" if pd.notna(reviews) else "N/A"
-            lines.append(f"- **{str(r.get('title',''))[:90]}** — {price_s}, ⭐ {rating_s} ({reviews_s})")
-        if lines:
-            return df, "Top picks:\n" + "\n".join(lines)
     return df, None
 
-def retrieval_for_chat(q: str, model, df_all, index, limit=12) -> pd.DataFrame:
-    res = search_plus(q, model, df_all, index, top_k=40)
-    if "price_float" not in res.columns:
-        def _coerce(x):
-            if isinstance(x,(int,float,np.floating)) and not pd.isna(x): return float(x)
-            if isinstance(x,str):
-                m = re.search(r"[-+]?\d*\.?\d+", x)
-                if m:
-                    try: return float(m.group())
-                    except: return np.nan
-            return np.nan
-        res["price_float"] = res.get("display_price", np.nan).map(_coerce)
-    return res.head(limit).copy()
+# ---------------------- Gemini helpers (everything via Gemini) ----------------------
+def g_call(system_instruction: str, user_text: str) -> str:
+    """Robust Gemini call with non-empty fallback string."""
+    if not GEMINI_OK:
+        return ""
+    try:
+        m = genai.GenerativeModel(GEM_MODEL, system_instruction=system_instruction)
+        out = m.generate_content(user_text)
+        txt = (out.text or "").strip()
+        if not txt:
+            # retry once with a nudge
+            out2 = m.generate_content(user_text + "\n\nPlease answer naturally in 1–3 sentences.")
+            txt = (out2.text or "").strip()
+        return sanitize_md(txt) if txt else ""
+    except Exception as e:
+        badge(f"Gemini error: {e}", ok=False)
+        return ""
 
-def chat_input_safe(prompt: str):
-    # Fallback for old Streamlit versions
-    if hasattr(st, "chat_input"):
-        return st.chat_input(prompt)
+def g_smalltalk(user_msg: str) -> str:
+    sys = ("You are a warm, concise assistant. This is small talk only — "
+           "do not suggest products unless the user asks about shopping. "
+           "Respond in 1–3 sentences.")
+    txt = g_call(sys, user_msg)
+    if txt:
+        return txt
+    # final fallback (never 'Okay!')
+    m = user_msg.lower()
+    if "name" in m: return "I’m your shopping assistant."
+    if any(x in m for x in ["how are you", "how's it going", "how are u"]):
+        return "I’m doing great—thanks! What can I help you find today?"
+    if any(x in m for x in ["hello", "hi", "hey", "what's up"]):
+        return "Hi there! What are you shopping for today?"
+    if any(x in m for x in ["thanks", "thank you", "thx"]):
+        return "You’re welcome! Need anything else?"
+    return "I’m here! Tell me what you’re looking for and I’ll help."
+
+def g_grounded_list(user_msg: str, numbered_bullets: List[str]) -> str:
+    """Ask Gemini to present numbered bullets with blank lines — using only provided bullets."""
+    if not GEMINI_OK or not numbered_bullets:
+        return ""
+    sys = ("You are a helpful shopping assistant. Use ONLY the provided catalog bullets. "
+           "Present at least 3 items as **numbered bullets** (1., 2., 3., …), "
+           "with a blank line between bullets. Keep it concise.")
+    txt = g_call(sys, user_msg + "\n\n" + "\n".join(numbered_bullets))
+    if not txt:
+        return ""
+    # ensure spacing between numbered bullets
+    txt = re.sub(r"\n(\d+\.)", r"\n\n\\1", txt).lstrip()
+    return txt
+
+def bullets_from_df(df: pd.DataFrame, limit=6) -> List[str]:
+    out=[]
+    df = ensure_price_float(df)
+    for i, (_, r) in enumerate(df.head(limit).iterrows(), 1):
+        p = price_str(r.get("price_float") if "price_float" in r else r.get("display_price"))
+        rt = r.get("average_rating"); rt_s = f"{float(rt):.2f}" if pd.notna(rt) else "N/A"
+        rv = r.get("rating_number"); rv_s = f"{int(rv):,}" if pd.notna(rv) else "N/A"
+        out.append(f"{i}. **{str(r.get('title',''))[:90]}** — {p}, ⭐ {rt_s} ({rv_s})")
+    return out
+
+# ---------------------- Chat state ----------------------
+if "chat" not in st.session_state:
+    st.session_state.chat = []
+if "last_query" not in st.session_state:
+    st.session_state.last_query = ""
+if "last_top5" not in st.session_state:
+    st.session_state.last_top5 = []
+
+def reset_conversation():
+    st.session_state.chat = []
+    st.session_state.last_query = ""
+    st.session_state.last_top5 = []
+
+# History
+for m in st.session_state.chat:
+    role = m.get("role","assistant")
+    with st.chat_message(role) if hasattr(st, "chat_message") else st.container():
+        st.markdown(m.get("content",""))
+
+# Welcome
+if not st.session_state.chat:
+    hello = "Hi! Ask me anything — e.g., **best under $20**, **thin iPhone 14 case**, **compare 2 & 5**, **sort by value**."
+    st.session_state.chat.append({"role":"assistant","content":hello})
+    with st.chat_message("assistant"): st.markdown(hello)
+
+# Bottom-right Reset conversation button
+with st.container():
+    c1, c2, c3 = st.columns([0.70, 0.15, 0.15])
+    with c3:
+        if st.button("🗑️ Reset conversation", use_container_width=True, help="Clear chat (keep data/model cached)"):
+            reset_conversation()
+            st.rerun()
+
+# ---------------------- Main chat loop ----------------------
+user_msg = st.chat_input("Ask naturally… I’ll search when needed (e.g., “best under $20”, “compare 2 & 5”).")
+
+def handle_compare_request(user_msg: str) -> bool:
+    i, j = parse_pair(user_msg, len(st.session_state.last_top5))
+    if i is None or j is None or not st.session_state.last_top5:
+        return False
+    left, right = st.session_state.last_top5[i], st.session_state.last_top5[j]
+    bloc = f"Comparing **#{i+1}** and **#{j+1}** from your current list:"
+    with st.chat_message("assistant"):
+        st.markdown(bloc)
+        render_pretty_compare(left, right)
+        try:
+            result = judge_products(st.session_state.last_query or user_msg, left, right, use_crewai=True, model=GEM_MODEL)
+            render_streamlit_card(result)
+        except Exception as e:
+            st.caption(f"(AI judge fallback: {e})")
+            render_streamlit_card(judge_products(st.session_state.last_query or user_msg, left, right, use_crewai=False))
+        st.markdown("\n**Anything else I can help you with?**")
+    st.session_state.chat.append({"role":"assistant","content":bloc + "\n\n**Anything else I can help you with?**"})
+    return True
+
+def run_retrieval_and_reply(user_msg: str):
+    st.session_state.last_query = user_msg
+    with st.spinner("Searching catalog…"):
+        res = search_all_shards(user_msg, model, dfs, idxs, top_k_per=12, final_top=48)
+    if res.empty:
+        msg = g_call(
+            "You are kind and concise. Explain there are no catalog matches and suggest trying different keywords.",
+            user_msg
+        ) or "I couldn’t find matches in the catalog. Try different keywords?"
+        st.session_state.chat.append({"role":"assistant","content":msg})
+        with st.chat_message("assistant"): st.markdown(msg)
+        return
+
+    res = ensure_price_float(res)
+    top = rerank_by_similarity(user_msg, res, model, top_n=5)
+
+    tmp = top.copy()
+    tmp["price"] = tmp.get("display_price", "N/A")
+    tmp["average_rating"] = tmp.get("average_rating", np.nan)
+    tmp["rating_number"] = tmp.get("rating_number", np.nan)
+    tmp["features"] = tmp.get("features", [])
+    tmp["categories"] = tmp.get("categories", [])
+    tmp["description"] = tmp.get("description", "")
+    if "store" not in tmp.columns and "brand_clean" in tmp.columns:
+        tmp["store"] = tmp["brand_clean"]
+    st.session_state.last_top5 = tmp.to_dict(orient="records")
+
+    acted_df, summary = apply_text_action(user_msg, res)
+    bullets_src = acted_df if not acted_df.empty else res
+    numbered = bullets_from_df(bullets_src, limit=max(5, min(6, len(bullets_src))))
+    # ask Gemini to format the numbered list (at least 3, blank line spacing)
+    grounded = g_grounded_list(user_msg, numbered)
+    if grounded.strip():
+        blines = grounded
     else:
-        return st.text_input(prompt, key="chat_input_fallback")
+        # local fallback
+        fallback_list = bullets_from_df(tmp if len(tmp) >= 3 else res, limit=max(3, min(6, len(res))))
+        blines = "\n\n".join(fallback_list)
 
-def render_chat_section(seed_query: str, model, df_all, index, top5_results):
-    st.markdown("### 💬 Chat (Gemini)")
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            {"role":"assistant","content":"Hi! Ask me anything — budget picks, sorting, or try 'compare 2 & 3'."}
-        ]
-    for m in st.session_state.chat_history:
-        with st.chat_message(m["role"]) if hasattr(st, "chat_message") else st.container():
-            st.markdown(m["content"])
+    pre = g_call(
+        "You are a concise, friendly shopping assistant. Acknowledge the request in 1 sentence.",
+        user_msg
+    ) or "Here are good options I found."
+    if summary: pre += "\n\n" + summary
 
-    user_msg = chat_input_safe("Ask naturally… e.g., 'best under $20', 'compare 2 & 3', 'sort by value'")
-    if not user_msg:
-        return
-    st.session_state.chat_history.append({"role":"user","content":user_msg})
-    with st.chat_message("user") if hasattr(st, "chat_message") else st.container():
-        st.markdown(user_msg)
+    tail = ("\n\nI can compare any two — e.g., **2 & 5**.\n\n"
+            "**Anything else I can help you with?**")
+    final = pre + ("\n\n" if blines else "") + blines + tail
 
-    opening = gemini_opening(user_msg)
+    st.session_state.chat.append({"role":"assistant","content":final})
+    with st.chat_message("assistant"): st.markdown(final)
 
-    # Compare refs to Top 5 (e.g., "2 & 3" or "B vs D")
-    if top5_results:
-        def _parse_nums(text: str, max_len: int):
-            nums = re.findall(r"\b([1-5])\b", text)
-            if len(nums) >= 2:
-                i, j = int(nums[0]) - 1, int(nums[1]) - 1
-                if 0 <= i < max_len and 0 <= j < max_len and i != j: return i, j
-            letters = re.findall(r"\b([A-Ea-e])\b", text)
-            if len(letters) >= 2:
-                mapL = {c:i for i,c in enumerate("ABCDE")}
-                i, j = mapL[letters[0].upper()], mapL[letters[1].upper()]
-                if 0 <= i < max_len and 0 <= j < max_len and i != j: return i, j
-            return None, None
+try:
+    if user_msg:
+        st.session_state.chat.append({"role":"user","content":user_msg})
+        with st.chat_message("user"): st.markdown(user_msg)
 
-        i, j = _parse_nums(user_msg, len(top5_results))
-        if i is not None and j is not None:
-            left, right = top5_results[i], top5_results[j]
-            reply = opening + f"\n\nComparing **#{i+1}** and **#{j+1}** (see panel)."
-            st.session_state.chat_history.append({"role":"assistant","content":reply})
-            with st.chat_message("assistant") if hasattr(st, "chat_message") else st.container():
-                st.markdown(reply)
-            st.markdown("---")
-            st.subheader("🔍 Comparison (Chat)")
-            st.markdown(f"**A. {left.get('title','(Untitled)')}**")
-            st.markdown(f"**B. {right.get('title','(Untitled)')}**")
-            render_pretty_compare(left, right)
-            try:
-                result = judge_products(seed_query or user_msg, left, right, use_crewai=True, model="gemini-1.5-flash")
-                render_streamlit_card(result)
-            except Exception as e:
-                st.warning(f"AI agent issue; using local scoring: {e}")
-                result = judge_products(seed_query or user_msg, left, right, use_crewai=False)
-                render_streamlit_card(result)
-            return
+        # 1) If user references previous results to compare
+        if handle_compare_request(user_msg):
+            pass
 
-    # Retrieval + optional filter/sort/recommend
-    if df_all is None or index is None or model is None:
-        final = opening + "\n\n(I couldn't access the dataset/models right now — check errors above.)"
-        st.session_state.chat_history.append({"role":"assistant","content":final})
-        with st.chat_message("assistant") if hasattr(st, "chat_message") else st.container():
-            st.markdown(final)
-        return
+        # 2) Shopping intent → retrieval + Gemini-grounded list
+        elif has_shopping_intent(user_msg) and model is not None and dfs and idxs:
+            run_retrieval_and_reply(user_msg)
 
-    retrieved = retrieval_for_chat(user_msg, model, df_all, index, limit=12)
-    acted_df, summary = apply_text_action(user_msg, retrieved)
-    grounded = grounded_reply(user_msg, acted_df if not acted_df.empty else retrieved)
+        # 3) Small talk (Gemini-based, but no products)
+        elif is_small_talk(user_msg):
+            reply = g_smalltalk(user_msg)
+            st.session_state.chat.append({"role":"assistant","content":reply})
+            with st.chat_message("assistant"): st.markdown(reply)
 
-    final = opening
-    if summary: final += "\n\n" + summary
-    if grounded: final += ("\n\n" if summary else "\n\n") + grounded
-
-    st.session_state.chat_history.append({"role":"assistant","content":final})
-    with st.chat_message("assistant") if hasattr(st, "chat_message") else st.container():
-        st.markdown(final)
-
-# ─────────────────────────────────────────────────────────
-# Main search bar & Top 5 + Compare
-# ─────────────────────────────────────────────────────────
-query = st.text_input("Enter your product search query:", placeholder="e.g. slim iPhone X case / note 5 leather case")
-
-if model is not None and df_all is not None and index is not None:
-    if query:
-        with st.spinner("Searching..."):
-            full_results = search_plus(query, model, df_all, index, top_k=30)
-            if "price_float" not in full_results.columns:
-                def _coerce(x):
-                    if isinstance(x,(int,float,np.floating)) and not pd.isna(x): return float(x)
-                    if isinstance(x,str):
-                        m = re.search(r"[-+]?\d*\.?\d+", x)
-                        if m:
-                            try: return float(m.group())
-                            except: return np.nan
-                    return np.nan
-                full_results["price_float"] = full_results.get("display_price", np.nan).map(_coerce)
-
-            results = rerank_by_similarity(query, full_results, model, top_n=5)
-
-        if results.empty:
-            st.warning("❌ No results found. Try broader keywords.")
-            render_chat_section(query, model, df_all, index, top5_results=[])
+        # 4) Fallback (Gemini reply; if no catalog available and not small talk, explain)
         else:
-            tmp = results.copy()
-            tmp["price"] = tmp.get("display_price", "N/A")
-            tmp["average_rating"] = tmp.get("average_rating", np.nan)
-            tmp["rating_number"] = tmp.get("rating_number", np.nan)
-            tmp["features"] = tmp.get("features", [])
-            tmp["categories"] = tmp.get("categories", [])
-            tmp["description"] = tmp.get("description", "")
-            if "store" not in tmp.columns and "brand_clean" in tmp.columns:
-                tmp["store"] = tmp["brand_clean"]
+            if not (model and dfs and idxs):
+                reply = g_call(
+                    "You are helpful and concise. Explain you can chat, but catalog access is currently unavailable.",
+                    user_msg
+                ) or "I’m here to help — but I can’t access the catalog right now."
+            else:
+                reply = g_smalltalk(user_msg)
+            st.session_state.chat.append({"role":"assistant","content":reply})
+            with st.chat_message("assistant"): st.markdown(reply)
 
-            top5_results = tmp.head(5).to_dict(orient="records")
+except Exception as e:
+    st.error(f"Something went wrong handling your last message: {e}")
+    st.info("You can keep chatting or tap **Reload app** (top-right) to fully restart.")
 
-            # Render Top 5 cards + compare panel
-            st.markdown("## Top 5")
-            for i, p in enumerate(top5_results):
-                col_txt, _ = st.columns([7, 1])
-                with col_txt:
-                    st.markdown(product_card_html(p), unsafe_allow_html=True)
-                    st.caption(f"#{i+1}")
-
-            # Compare checkbox panel (same as before)
-            st.divider()
-            st.subheader("Select any 2 above (A/B) using the old compare panel?")
-            # Re-render using checkboxes version for familiarity
-            # (kept minimal: just device the old function inline)
-            # We'll reconstruct pool quickly:
-            if "compare_pool" not in st.session_state:
-                st.session_state.compare_pool = []
-            def add_or_remove(idx):
-                if idx in st.session_state.compare_pool:
-                    st.session_state.compare_pool.remove(idx)
-                else:
-                    st.session_state.compare_pool.append(idx)
-                    if len(st.session_state.compare_pool) > 2:
-                        st.session_state.compare_pool = st.session_state.compare_pool[-2:]
-
-            cols = st.columns(5)
-            for i in range(len(top5_results)):
-                with cols[i]:
-                    if st.checkbox(f"Pick #{i+1}", key=f"pick_{i}"):
-                        add_or_remove(i)
-
-            if len(st.session_state.compare_pool) == 2:
-                a_i, b_i = st.session_state.compare_pool
-                left, right = top5_results[a_i], top5_results[b_i]
-                st.markdown("---")
-                st.subheader("🔍 Comparison Panel (2 items selected)")
-                st.markdown(f"**A. {left.get('title','(Untitled)')}**")
-                st.markdown(f"**B. {right.get('title','(Untitled)')}**")
-                render_pretty_compare(left, right)
-                try:
-                    result = judge_products(query or "", left, right, use_crewai=True, model="gemini-1.5-flash")
-                    render_streamlit_card(result)
-                except Exception as e:
-                    st.warning(f"AI agent issue; using local scoring: {e}")
-                    result = judge_products(query or "", left, right, use_crewai=False)
-                    render_streamlit_card(result)
-
-            # Chat (Gemini-first)
-            st.divider()
-            render_chat_section(query, model, df_all, index, top5_results=top5_results)
-
-    else:
-        st.info("Type a query to begin — or just chat below, I’ll search when needed.")
-        render_chat_section("", model, df_all, index, top5_results=[])
-else:
-    st.stop()  # we already showed error messages above
